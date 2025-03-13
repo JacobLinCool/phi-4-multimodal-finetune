@@ -1,0 +1,13 @@
+torch
+transformers
+accelerate
+peft
+scipy
+backoff
+datasets
+jiwer
+tqdm
+flash-attn
+tensorboard
+librosa
+soundfile
