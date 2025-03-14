@@ -45,11 +45,7 @@ def load_model_and_processor(model_name_or_path, use_flash_attention=False):
 def transcribe_audio(model, processor, audio_path):
     """Transcribe audio from the given file path."""
     # Load and preprocess audio
-    audio, sr = librosa.load(audio_path, sr=None)
-    if sr != 16000:
-        # Resample to 16kHz if needed
-        audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
-        sr = 16000
+    audio, sr = librosa.load(audio_path, sr=16000)
 
     # Prepare input for the model
     user_message = {
