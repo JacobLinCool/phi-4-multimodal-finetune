@@ -197,9 +197,9 @@ def main():
     num_gpus = accelerator.num_processes
     print(f"training on {num_gpus} GPUs")
     assert (
-        args.batch_size % (num_gpus * args.batch_size_per_gpu) == 0
+        args.global_batch_size % (num_gpus * args.batch_size_per_gpu) == 0
     ), "Batch size must be divisible by the number of GPUs"
-    gradient_accumulation_steps = args.batch_size // (
+    gradient_accumulation_steps = args.global_batch_size // (
         num_gpus * args.batch_size_per_gpu
     )
 

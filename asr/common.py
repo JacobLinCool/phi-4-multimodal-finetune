@@ -342,7 +342,7 @@ def evaluate(
         generated_ids = model.generate(
             **inputs,
             eos_token_id=processor.tokenizer.eos_token_id,
-            max_new_tokens=64,
+            max_new_tokens=320,
             stopping_criteria=stopping_criteria,
         )
         stop_tokens_idx = stopping_criteria[0].stop_tokens_idx.reshape(
@@ -442,7 +442,7 @@ def transcribe_audio(model, processor, audio_path):
         generated_ids = model.generate(
             **inputs,
             eos_token_id=processor.tokenizer.eos_token_id,
-            max_new_tokens=64,
+            max_new_tokens=320,
             stopping_criteria=stopping_criteria,
             do_sample=False,  # Deterministic generation
         )
