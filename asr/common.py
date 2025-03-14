@@ -1,11 +1,8 @@
-import argparse
-import json
 import os
-from pathlib import Path
+import json
 
 import torch
 import jiwer
-from accelerate import Accelerator
 from accelerate.utils import gather_object
 from datasets import load_dataset
 from torch.utils.data import Dataset
@@ -17,11 +14,51 @@ from transformers import (
     StoppingCriteria,
     StoppingCriteriaList,
 )
+import librosa
 
 ANSWER_SUFFIX = "<|end|><|endoftext|>"
+_IGNORE_INDEX = -100
 
 
-class EvalDataset(Dataset):
+class MultipleTokenStoppingCriteria(StoppingCriteria):
+    def __init__(self, stop_tokens: torch.LongTensor) -> None:
+        self.stop_tokens = stop_tokens
+        self.max_stop_tokens = stop_tokens.shape[-1]
+
+    def __call__(
+        self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs
+    ) -> bool:
+        for stop_token_list in self.stop_tokens:
+            token_len = stop_token_list.shape[0]
+            if token_len <= input_ids.shape[1] and torch.all(
+                input_ids[0, -token_len:] == stop_token_list
+            ):
+                return True
+        return False
+
+
+class MultipleTokenBatchStoppingCriteria(StoppingCriteria):
+    def __init__(self, stop_tokens: torch.LongTensor, batch_size: int = 1) -> None:
+        self.stop_tokens = stop_tokens
+        self.max_stop_tokens = stop_tokens.shape[-1]
+        self.stop_tokens_idx = torch.zeros(
+            batch_size, dtype=torch.long, device=stop_tokens.device
+        )
+
+    def __call__(
+        self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs
+    ) -> bool:
+        generated_inputs = torch.eq(
+            input_ids[:, -self.max_stop_tokens :].unsqueeze(1), self.stop_tokens
+        )
+        equal_generated_inputs = torch.all(generated_inputs, dim=2)
+        sequence_idx = torch.any(equal_generated_inputs, dim=1)
+        sequence_set_mask = self.stop_tokens_idx == 0
+        self.stop_tokens_idx[sequence_idx & sequence_set_mask] = input_ids.shape[-1]
+        return torch.all(self.stop_tokens_idx)
+
+
+class BaseDataset(Dataset):
     def __init__(
         self,
         processor,
@@ -32,8 +69,13 @@ class EvalDataset(Dataset):
         max_samples=None,
         rank=0,
         world_size=1,
+        dataset_subset=None,
     ):
-        self.data = load_dataset(dataset_name, split=split)
+        self.data = (
+            load_dataset(dataset_name, dataset_subset, split=split)
+            if dataset_subset
+            else load_dataset(dataset_name, split=split)
+        )
         if max_samples is not None:
             self.data = self.data.select(range(max_samples))
         if world_size > 1:
@@ -46,6 +88,8 @@ class EvalDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
+
+class EvalDataset(BaseDataset):
     def __getitem__(self, idx):
         """
         Each example in the dataset is expected to have:
@@ -74,6 +118,75 @@ class EvalDataset(Dataset):
         answer_ids = self.processor.tokenizer(answer, return_tensors="pt").input_ids
         input_ids = inputs.input_ids
         labels = answer_ids
+
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "input_audio_embeds": inputs.input_audio_embeds,
+            "audio_embed_sizes": inputs.audio_embed_sizes,
+        }
+
+
+class FinetuneDataset(BaseDataset):
+    def __init__(
+        self,
+        processor,
+        dataset_name,
+        split,
+        training,
+        text_column="text",
+        audio_column="audio",
+        max_samples=None,
+        rank=0,
+        world_size=1,
+        dataset_subset=None,
+    ):
+        super().__init__(
+            processor,
+            dataset_name,
+            split,
+            text_column,
+            audio_column,
+            max_samples,
+            rank,
+            world_size,
+            dataset_subset,
+        )
+        self.training = training
+
+    def __getitem__(self, idx):
+        """
+        Each example in the dataset is expected to have:
+          - '{audio_column}': a dict with keys "array" and "sampling_rate"
+          - '{text_column}': the transcription string.
+        """
+        data = self.data[idx]
+        user_message = {
+            "role": "user",
+            "content": "<|audio_1|> " + self.instruction,
+        }
+        prompt = self.processor.tokenizer.apply_chat_template(
+            [user_message], tokenize=False, add_generation_prompt=True
+        )
+        inputs = self.processor(
+            text=prompt,
+            audios=[
+                (
+                    data[self.audio_column]["array"],
+                    data[self.audio_column]["sampling_rate"],
+                )
+            ],
+            return_tensors="pt",
+        )
+        answer = f"{data[self.text_column]}{ANSWER_SUFFIX}"
+        answer_ids = self.processor.tokenizer(answer, return_tensors="pt").input_ids
+        if self.training:
+            input_ids = torch.cat([inputs.input_ids, answer_ids], dim=1)
+            labels = torch.full_like(input_ids, _IGNORE_INDEX)
+            labels[:, -answer_ids.shape[1] :] = answer_ids
+        else:
+            input_ids = inputs.input_ids
+            labels = answer_ids
 
         return {
             "input_ids": input_ids,
@@ -164,36 +277,20 @@ def collate_fn(batch):
     )
 
 
-# Stopping criteria for generation that handles multiple stop tokens
-class MultipleTokenBatchStoppingCriteria(StoppingCriteria):
-    def __init__(self, stop_tokens: torch.LongTensor, batch_size: int = 1) -> None:
-        self.stop_tokens = stop_tokens
-        self.max_stop_tokens = stop_tokens.shape[-1]
-        self.stop_tokens_idx = torch.zeros(
-            batch_size, dtype=torch.long, device=stop_tokens.device
-        )
+def load_model_and_processor(model_name_or_path, use_flash_attention=False):
+    """Load the model and processor from the specified path or model name."""
+    processor = AutoProcessor.from_pretrained(
+        model_name_or_path, trust_remote_code=True
+    )
 
-    def __call__(
-        self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs
-    ) -> bool:
-        generated_inputs = torch.eq(
-            input_ids[:, -self.max_stop_tokens :].unsqueeze(1), self.stop_tokens
-        )
-        equal_generated_inputs = torch.all(generated_inputs, dim=2)
-        sequence_idx = torch.any(equal_generated_inputs, dim=1)
-        sequence_set_mask = self.stop_tokens_idx == 0
-        self.stop_tokens_idx[sequence_idx & sequence_set_mask] = input_ids.shape[-1]
-        return torch.all(self.stop_tokens_idx)
-
-
-def create_model(model_name_or_path, use_flash_attention=False):
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
         torch_dtype=torch.bfloat16 if use_flash_attention else torch.float32,
         _attn_implementation="flash_attention_2" if use_flash_attention else "sdpa",
         trust_remote_code=True,
-    ).to("cuda")
-    return model
+    ).to("cuda" if torch.cuda.is_available() else "cpu")
+
+    return model, processor
 
 
 @torch.no_grad()
@@ -204,9 +301,10 @@ def evaluate(
     save_path=None,
     disable_tqdm=False,
     eval_batch_size=1,
+    metric="wer",
 ):
     """
-    Evaluate the model on the dataset and calculate both WER and CER
+    Evaluate the model on the dataset and calculate WER and/or CER
     """
     rank = int(os.environ.get("RANK", 0))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -276,14 +374,19 @@ def evaluate(
     results = {}
     if rank == 0:
         assert len(all_generated_texts) == len(all_labels)
-        # Calculate both WER and CER
-        wer_score = jiwer.wer(" ".join(all_labels), " ".join(all_generated_texts))
-        cer_score = jiwer.cer(" ".join(all_labels), " ".join(all_generated_texts))
 
-        results = {"wer": wer_score, "cer": cer_score, "num_samples": len(all_labels)}
+        # Calculate either WER or CER or both based on parameter
+        if metric.lower() == "wer" or metric.lower() == "both":
+            wer_score = jiwer.wer(" ".join(all_labels), " ".join(all_generated_texts))
+            results["wer"] = wer_score
+            print(f"WER Score: {wer_score:.4f}")
 
-        print(f"WER Score: {wer_score:.4f}")
-        print(f"CER Score: {cer_score:.4f}")
+        if metric.lower() == "cer" or metric.lower() == "both":
+            cer_score = jiwer.cer(" ".join(all_labels), " ".join(all_generated_texts))
+            results["cer"] = cer_score
+            print(f"CER Score: {cer_score:.4f}")
+
+        results["num_samples"] = len(all_labels)
         print(f"Number of samples: {len(all_labels)}")
 
         if save_path:
@@ -291,122 +394,68 @@ def evaluate(
                 save_dict = {
                     "all_generated_texts": all_generated_texts,
                     "all_labels": all_labels,
-                    "wer": wer_score,
-                    "cer": cer_score,
-                    "num_samples": len(all_labels),
+                    **results,
                 }
                 json.dump(save_dict, f, indent=4, ensure_ascii=False)
 
     return results
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Evaluate ASR models with WER and CER metrics"
-    )
-    parser.add_argument(
-        "--model_name_or_path",
-        type=str,
-        default="microsoft/Phi-4-multimodal-instruct",
-        help="Model name or path to load from",
-    )
-    parser.add_argument(
-        "--dataset_name",
-        type=str,
-        default="JacobLinCool/common_voice_19_0_zh-TW",
-        help="Dataset name to use for evaluation",
-    )
-    parser.add_argument(
-        "--split",
-        type=str,
-        default="test",
-        help="Dataset split to use for evaluation",
-    )
-    parser.add_argument(
-        "--max_samples",
-        type=int,
-        help="Maximum number of evaluation samples",
-    )
-    parser.add_argument(
-        "--use_flash_attention",
-        action="store_true",
-        help="Use Flash Attention for more efficient inference on compatible hardware",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="./eval_results/",
-        help="Output directory for saving evaluation results",
-    )
-    parser.add_argument(
-        "--batch_size", type=int, default=1, help="Batch size for evaluation"
-    )
-    parser.add_argument(
-        "--text_column",
-        type=str,
-        default="text",
-        help="Name of the column containing the transcription text",
-    )
-    parser.add_argument(
-        "--audio_column",
-        type=str,
-        default="audio",
-        help="Name of the column containing the audio data",
-    )
-    parser.add_argument(
-        "--no-tqdm", dest="tqdm", action="store_false", help="Disable tqdm progress bar"
-    )
-    args = parser.parse_args()
+def transcribe_audio(model, processor, audio_path):
+    """Transcribe audio from the given file path."""
 
-    accelerator = Accelerator()
+    # Load and preprocess audio
+    audio, sr = librosa.load(audio_path, sr=16000)
 
-    with accelerator.local_main_process_first():
-        processor = AutoProcessor.from_pretrained(
-            args.model_name_or_path,
-            trust_remote_code=True,
-        )
-        model = create_model(
-            args.model_name_or_path,
-            use_flash_attention=args.use_flash_attention,
+    # Prepare input for the model
+    user_message = {
+        "role": "user",
+        "content": "<|audio_1|> Transcribe the audio clip into text.",
+    }
+    prompt = processor.tokenizer.apply_chat_template(
+        [user_message], tokenize=False, add_generation_prompt=True
+    )
+
+    # Process input
+    inputs = processor(
+        text=prompt,
+        audios=[(audio, sr)],
+        return_tensors="pt",
+    )
+
+    # Move inputs to the same device as the model
+    inputs = {
+        k: v.to(model.device) if hasattr(v, "to") else v for k, v in inputs.items()
+    }
+
+    # Set up stopping criteria
+    stop_tokens = ["<|end|>", processor.tokenizer.eos_token]
+    stop_tokens_ids = processor.tokenizer(
+        stop_tokens, add_special_tokens=False, padding="longest", return_tensors="pt"
+    )["input_ids"].to(model.device)
+    stopping_criteria = StoppingCriteriaList(
+        [MultipleTokenStoppingCriteria(stop_tokens_ids)]
+    )
+
+    # Generate transcription
+    with torch.no_grad():
+        generated_ids = model.generate(
+            **inputs,
+            eos_token_id=processor.tokenizer.eos_token_id,
+            max_new_tokens=64,
+            stopping_criteria=stopping_criteria,
+            do_sample=False,  # Deterministic generation
         )
 
-    rank = int(os.environ.get("RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-
-    eval_dataset = EvalDataset(
-        processor,
-        dataset_name=args.dataset_name,
-        split=args.split,
-        text_column=args.text_column,
-        audio_column=args.audio_column,
-        max_samples=args.max_samples,
-        rank=rank,
-        world_size=world_size,
+    # Decode the generated text
+    transcription = processor.decode(
+        generated_ids[0, inputs["input_ids"].shape[1] :],
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
     )
 
-    # Create output directory if it doesn't exist
-    out_path = Path(args.output_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
+    # Clean up the transcription (remove any potential end tokens that weren't caught by the stopping criteria)
+    for token in stop_tokens:
+        transcription = transcription.replace(token, "")
 
-    # Generate a descriptive filename for the results
-    dataset_name = args.dataset_name.split("/")[-1]
-    model_name = args.model_name_or_path.split("/")[-1]
-    results_filename = f"{model_name}_{dataset_name}_{args.split}.json"
-    save_path = out_path / results_filename
-
-    # Run evaluation
-    evaluate(
-        model,
-        processor,
-        eval_dataset,
-        save_path=save_path,
-        disable_tqdm=not args.tqdm,
-        eval_batch_size=args.batch_size,
-    )
-
-    if accelerator.is_main_process:
-        print(f"Evaluation results saved to {save_path}")
-
-
-if __name__ == "__main__":
-    main()
+    return transcription.strip()
