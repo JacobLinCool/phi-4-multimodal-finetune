@@ -1,6 +1,7 @@
 import argparse
 import os
 from pathlib import Path
+import json
 
 import torch
 from accelerate import Accelerator
@@ -9,7 +10,7 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
-from huggingface_hub import whoami
+from huggingface_hub import whoami, delete_file, upload_file
 
 from .common import (
     FinetuneDataset,
@@ -274,6 +275,37 @@ def main():
     trainer.save_model()
     if accelerator.is_main_process:
         processor.save_pretrained(training_args.output_dir)
+        if args.push_to_hub:
+            processor.push_to_hub(args.hub_model_id)
+
+    if args.push_to_hub:
+        # we need to remove chat_template.json on the hub
+        delete_file(
+            repo_id=args.hub_model_id,
+            path_in_repo="chat_template.json",
+            repo_type="model",
+        )
+        # we need to overwrite preprocessor_config.json on the hub
+        preprocessor_config = {
+            "auto_map": {
+                "AutoFeatureExtractor": "microsoft/Phi-4-multimodal-instruct--processing_phi4mm.Phi4MMAudioFeatureExtractor",
+                "AutoImageProcessor": "microsoft/Phi-4-multimodal-instruct--processing_phi4mm.Phi4MMImageProcessor",
+                "AutoProcessor": "microsoft/Phi-4-multimodal-instruct--processing_phi4mm.Phi4MMProcessor",
+            },
+            "feature_extractor_type": "Phi4MMAudioFeatureExtractor",
+            "image_processor_type": "Phi4MMImageProcessor",
+            "processor_class": "Phi4MMProcessor",
+            "audio_compression_rate": 8,
+            "audio_downsample_rate": 1,
+            "audio_feat_stride": 1,
+            "dynamic_hd": 36,
+        }
+        upload_file(
+            path_or_fileobj=json.dumps(preprocessor_config, indent=2).encode(),
+            path_in_repo="preprocessor_config.json",
+            repo_id=args.hub_model_id,
+            repo_type="model",
+        )
 
     accelerator.wait_for_everyone()
 
